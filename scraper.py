@@ -121,21 +121,86 @@ class RosasidanScraper:
             response = self.make_request(profile_url)
             soup = BeautifulSoup(response.text, 'html.parser')
             
+            # Find the main content panel
+            content_panel = soup.find('div', class_='webpanelcontent3')
+            if not content_panel:
+                raise ValueError("Could not find main content panel")
+                
             # Extract profile information
             details = {
                 'profile_url': profile_url,
-                'title': soup.find('a', href='#').text.strip() if soup.find('a', href='#') else (soup.find('h3').text.strip() if soup.find('h3') else ''),
-                'username': soup.find('a', style='color:#9933FF').text.strip() if soup.find('a', style='color:#9933FF') else '',
-                'login': soup.find('div', string='Login:').find_next('div').text.strip() if soup.find('div', string='Login:') else '',
-                'from': soup.find('div', string='From:').find_next('div').text.strip() if soup.find('div', string='From:') else '',
-                'se': soup.find('div', string='SE:').find_next('div').text.strip() if soup.find('div', string='SE:') else '',
-                'price': soup.find('div', string='Price:').find_next('div').text.strip() if soup.find('div', string='Price:') else '',
-                'phone': soup.find('div', string='Phone:').find_next('div').text.strip() if soup.find('div', string='Phone:') else '',
-                'posted_by': soup.find('div', string='Posted by:').find_next('div').text.strip() if soup.find('div', string='Posted by:') else ''
-                'images': [img['src'] for img in soup.find_all('img', src=True) if 'uploads' in img['src']],
-                'image_count': len([1 for img in soup.find_all('img', src=True) if 'uploads' in img['src']]),
+                'title': '',
+                'username': '',
+                'description': '',
+                'price': '',
+                'phone': '',
+                'skype': '',
+                'kik': '',
+                'posted_by': '',
+                'posted_time': '',
+                'images': [],
+                'image_count': 0,
                 'scrape_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
+            
+            # Extract title
+            title_link = content_panel.find('a', href='#')
+            if title_link:
+                details['title'] = title_link.text.strip()
+            
+            # Extract description
+            desc_div = content_panel.find('div', class_='ad_detail_column')
+            if desc_div:
+                details['description'] = desc_div.text.strip()
+            
+            # Extract price
+            price_row = content_panel.find('div', class_='row', string=lambda text: text and 'Price:' in text if text else False)
+            if price_row:
+                price_value = price_row.find('div', class_='ad_detail_column')
+                if price_value:
+                    details['price'] = price_value.text.strip()
+            
+            # Extract phone
+            phone_value = content_panel.find('a', class_='phone_value')
+            if phone_value:
+                details['phone'] = phone_value.text.strip()
+            
+            # Extract Skype
+            skype_value = content_panel.find('a', class_='skype_value')
+            if skype_value:
+                details['skype'] = skype_value.text.strip()
+            
+            # Extract KiK
+            kik_row = content_panel.find('div', class_='row', string=lambda text: text and 'KiK:' in text if text else False)
+            if kik_row:
+                kik_value = kik_row.find('div', class_='ad_detail_column')
+                if kik_value:
+                    details['kik'] = kik_value.text.strip()
+            
+            # Extract posted by
+            posted_by_row = content_panel.find('div', class_='row', string=lambda text: text and 'Posted by:' in text if text else False)
+            if posted_by_row:
+                posted_by_link = posted_by_row.find('a')
+                if posted_by_link:
+                    details['posted_by'] = posted_by_link.text.strip()
+                    details['username'] = posted_by_link.text.strip()
+            
+            # Extract posted time
+            posted_time_row = content_panel.find('div', class_='row', string=lambda text: text and 'Posted:' in text if text else False)
+            if posted_time_row:
+                posted_time = posted_time_row.find('div', class_='ad_detail_column')
+                if posted_time:
+                    details['posted_time'] = posted_time.text.strip()
+            
+            # Extract images
+            image_divs = content_panel.find_all('div', class_='ad-thumbnail-image')
+            for img_div in image_divs:
+                img = img_div.find('img')
+                if img and 'src' in img.attrs and 'uploads' in img['src']:
+                    img_url = urljoin(self.base_url, img['src'])
+                    details['images'].append(img_url)
+            
+            details['image_count'] = len(details['images'])
             
             logging.info(f"Successfully scraped details for {profile_url}")
             return details
