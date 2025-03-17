@@ -126,12 +126,12 @@ class RosasidanScraper:
                 'profile_url': profile_url,
                 'title': soup.find('a', href='#').text.strip() if soup.find('a', href='#') else (soup.find('h3').text.strip() if soup.find('h3') else ''),
                 'username': soup.find('a', style='color:#9933FF').text.strip() if soup.find('a', style='color:#9933FF') else '',
-                'login': soup.find('div', text='Login:').find_next('div').text.strip() if soup.find('div', text='Login:') else '',
-                'from': soup.find('div', text='From:').find_next('div').text.strip() if soup.find('div', text='From:') else '',
-                'se': soup.find('div', text='SE:').find_next('div').text.strip() if soup.find('div', text='SE:') else '',
-                'price': soup.find('div', text='Price:').find_next('div').text.strip() if soup.find('div', text='Price:') else '',
-                'phone': soup.find('div', text='Phone:').find_next('div').text.strip() if soup.find('div', text='Phone:') else '',
-                'posted_by': soup.find('div', text='Posted by:').find_next('div').text.strip() if soup.find('div', text='Posted by:') else '',
+                'login': soup.find('div', string='Login:').find_next('div').text.strip() if soup.find('div', string='Login:') else '',
+                'from': soup.find('div', string='From:').find_next('div').text.strip() if soup.find('div', string='From:') else '',
+                'se': soup.find('div', string='SE:').find_next('div').text.strip() if soup.find('div', string='SE:') else '',
+                'price': soup.find('div', string='Price:').find_next('div').text.strip() if soup.find('div', string='Price:') else '',
+                'phone': soup.find('div', string='Phone:').find_next('div').text.strip() if soup.find('div', string='Phone:') else '',
+                'posted_by': soup.find('div', string='Posted by:').find_next('div').text.strip() if soup.find('div', string='Posted by:') else ''
                 'images': [img['src'] for img in soup.find_all('img', src=True) if 'uploads' in img['src']],
                 'image_count': len([1 for img in soup.find_all('img', src=True) if 'uploads' in img['src']]),
                 'scrape_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -144,10 +144,27 @@ class RosasidanScraper:
             return {}
     
     def save_profile_links(self, links: Set[str], base_urls: Dict[str, Tuple[str, int]]):
-        """Save profile links to Excel file with base URL and page information"""
+        """Save profile links to Excel file with base URL and page information, avoiding duplicates"""
         try:
+            # Load existing links if file exists
+            existing_links = set()
+            if os.path.exists(self.profile_links_file):
+                try:
+                    existing_df = pd.read_excel(self.profile_links_file)
+                    existing_links = set(existing_df['profile_url'].tolist())
+                    logging.info(f"Loaded {len(existing_links)} existing profile links")
+                except Exception as e:
+                    logging.warning(f"Could not read existing profile links: {str(e)}")
+
+            # Filter out duplicate links
+            new_links = links - existing_links
+            if not new_links:
+                logging.info("No new profile links to save")
+                return
+
+            # Prepare new data
             data = []
-            for link in links:
+            for link in new_links:
                 base_info = base_urls.get(link, ('Unknown', 0))
                 data.append({
                     'profile_url': link,
@@ -155,9 +172,18 @@ class RosasidanScraper:
                     'page_number': base_info[1],
                     'scrape_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
-            df = pd.DataFrame(data)
-            df.to_excel(self.profile_links_file, index=False)
-            logging.info(f"Saved {len(links)} profile links to {self.profile_links_file}")
+
+            # Create new DataFrame with only new links
+            new_df = pd.DataFrame(data)
+
+            # If file exists, append new data; otherwise create new file
+            if os.path.exists(self.profile_links_file):
+                final_df = pd.concat([existing_df, new_df], ignore_index=True)
+            else:
+                final_df = new_df
+
+            final_df.to_excel(self.profile_links_file, index=False)
+            logging.info(f"Saved {len(new_links)} new profile links to {self.profile_links_file}")
         except Exception as e:
             logging.error(f"Error saving profile links to Excel: {str(e)}")
             raise
