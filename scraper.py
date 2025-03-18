@@ -10,6 +10,7 @@ import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import logging
+import hashlib
 
 # Configure logging
 logging.basicConfig(
@@ -26,7 +27,7 @@ class RosasidanScraper:
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        self.profile_csv = 'Profile Detail.csv'
+        self.profile_csv = 'profile_details.csv'
         self.profile_links_file = 'Profile Links.xlsx'
         
         # Configure retry strategy
@@ -36,10 +37,15 @@ class RosasidanScraper:
             status_forcelist=[500, 502, 503, 504, 429]  # HTTP status codes to retry on
         )
         
-        # Create session with retry strategy
+        # Create session with retry strategy and SSL configuration
         self.session = requests.Session()
         self.session.mount('https://', HTTPAdapter(max_retries=retry_strategy))
         self.session.headers.update(self.headers)
+        self.session.verify = False  # Disable SSL verification
+        
+        # Suppress only the InsecureRequestWarning from urllib3
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
     def make_request(self, url: str, timeout: int = 30) -> requests.Response:
         """Make HTTP request with retry and timeout handling"""
@@ -47,6 +53,9 @@ class RosasidanScraper:
             response = self.session.get(url, timeout=timeout)
             response.raise_for_status()
             return response
+        except requests.exceptions.SSLError as e:
+            logging.warning(f"SSL Error encountered for {url}: {str(e)}")
+            return self.session.get(url, timeout=timeout, verify=False)
         except requests.exceptions.Timeout:
             logging.error(f"Timeout error accessing {url}")
             raise
@@ -116,6 +125,33 @@ class RosasidanScraper:
         
         return profile_links, base_urls
     
+    def download_image(self, image_url: str, profile_id: str, index: int) -> str:
+        """Download an image and save it locally"""
+        try:
+            # Create images directory if it doesn't exist
+            os.makedirs('images', exist_ok=True)
+            
+            # Generate unique filename
+            file_extension = image_url.split('.')[-1].split('?')[0]
+            if not file_extension:
+                file_extension = 'jpg'
+            filename = f"{profile_id}_{index}.{file_extension}"
+            filepath = os.path.join('images', filename)
+            
+            # Download and save image
+            response = requests.get(image_url, stream=True)
+            response.raise_for_status()
+            
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            return filepath
+        except Exception as e:
+            logging.error(f"Error downloading image {image_url}: {str(e)}")
+            return ''
+
     def get_profile_details(self, profile_url: str) -> Dict:
         """Scrape details from a profile page"""
         try:
@@ -139,6 +175,9 @@ class RosasidanScraper:
             
             # Get base_url and title from profile links data
             link_info = profile_links_data.get(profile_url, {})
+            
+            # Generate unique profile ID from URL
+            profile_id = hashlib.md5(profile_url.encode()).hexdigest()[:10]
                 
             # Initialize details dictionary
             details = {
@@ -146,7 +185,8 @@ class RosasidanScraper:
                 'profile_url': profile_url,
                 'title': link_info.get('title', ''),
                 'scrape_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'images': []
+                'images': [],
+                'local_images': []
             }
             
             # Extract main details from ad_detail_column
@@ -187,12 +227,17 @@ class RosasidanScraper:
             if posted_date:
                 details['posted_date'] = posted_date.get_text(strip=True)
             
-            # Extract images
+            # Extract and download images
             image_divs = soup.find_all('div', class_='ad-thumbnail-image')
-            for div in image_divs:
+            for index, div in enumerate(image_divs):
                 img = div.find('img')
                 if img and img.get('src'):
-                    details['images'].append(img['src'])
+                    image_url = img['src']
+                    details['images'].append(image_url)
+                    # Download and save image locally
+                    local_path = self.download_image(image_url, profile_id, index)
+                    if local_path:
+                        details['local_images'].append(local_path)
             
             logging.info(f"Successfully scraped details for {profile_url}")
             return details
@@ -274,7 +319,7 @@ class RosasidanScraper:
             return set()
     
     def save_profile_details(self, profiles: List[Dict]):
-        """Save only new profile details in CSV file without updating existing ones"""
+        """Save only new profile details in CSV file and update changed profiles"""
         try:
             df = pd.DataFrame(profiles)
             
@@ -296,9 +341,26 @@ class RosasidanScraper:
                         continue
                 
                 if existing_df is not None:
-                    # Only append new profiles without updating existing ones
+                    # Create sets for efficient lookup
                     existing_urls = set(existing_df['profile_url'])
-                    df = pd.concat([existing_df, df[~df['profile_url'].isin(existing_urls)]], ignore_index=True)
+                    new_urls = set(df['profile_url'])
+                    
+                    # Split into new and existing profiles
+                    new_profiles = df[~df['profile_url'].isin(existing_urls)]
+                    existing_profiles = df[df['profile_url'].isin(existing_urls)]
+                    
+                    # For existing profiles, update only if data has changed
+                    if not existing_profiles.empty:
+                        for idx, row in existing_profiles.iterrows():
+                            existing_row = existing_df[existing_df['profile_url'] == row['profile_url']].iloc[0]
+                            # Compare relevant fields to check for changes
+                            fields_to_compare = ['details', 'price', 'phone', 'images']
+                            if any(row[field] != existing_row[field] for field in fields_to_compare if field in row and field in existing_row):
+                                # Update the existing row
+                                existing_df.loc[existing_df['profile_url'] == row['profile_url']] = row
+                    
+                    # Combine updated existing profiles with new ones
+                    df = pd.concat([existing_df, new_profiles], ignore_index=True)
                 
             # Save with UTF-8 encoding
             df.to_csv(self.profile_csv, index=False, encoding='utf-8')
@@ -307,24 +369,33 @@ class RosasidanScraper:
             logging.error(f"Error saving profile details: {str(e)}")
             raise
     
-    def save_new_profiles(self, profiles: List[Dict]):
-        """Save new profiles to a date-specific CSV file"""
+    def save_new_profiles(self, profiles: List[Dict], is_update: bool = False):
+        """Save new or updated profiles to a date-specific CSV file"""
         if not profiles:
-            logging.info("No new profiles to save")
+            logging.info("No profiles to save")
             return
             
         try:
             # Create filename with current date
             current_date = datetime.now().strftime('%Y_%m_%d')
-            new_profiles_file = f'new_profiles_{current_date}.csv'
+            file_prefix = 'updated' if is_update else 'new'
+            profiles_file = f'{file_prefix}_profiles_{current_date}.csv'
             
             # Create DataFrame and save to CSV
             df = pd.DataFrame(profiles)
             df['images'] = df['images'].apply(lambda x: '|'.join(x) if isinstance(x, list) else '')
-            df.to_csv(new_profiles_file, index=False)
-            logging.info(f'Saved {len(profiles)} new profiles to {new_profiles_file}')
+            df['update_type'] = 'update' if is_update else 'new'
+            df['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # If file exists, append to it
+            if os.path.exists(profiles_file):
+                existing_df = pd.read_csv(profiles_file)
+                df = pd.concat([existing_df, df], ignore_index=True)
+            
+            df.to_csv(profiles_file, index=False)
+            logging.info(f'Saved {len(profiles)} {file_prefix} profiles to {profiles_file}')
         except Exception as e:
-            logging.error(f"Error saving new profiles: {str(e)}")
+            logging.error(f"Error saving {file_prefix} profiles: {str(e)}")
             raise
     
     def run(self):
@@ -352,19 +423,41 @@ class RosasidanScraper:
             
             logging.info(f'Found {len(new_profiles)} new profiles')
             
-            # Scrape and save details for new profiles immediately
+            # Process both new and existing profiles
             processed_count = 0
+            updated_count = 0
+            
+            # First, process new profiles
+            new_profile_details = []
             for url in new_profiles:
                 details = self.get_profile_details(url)
                 if details:
-                    # Save each profile immediately after scraping
-                    self.save_profile_details([details])  # Save to main CSV
-                    self.save_new_profiles([details])     # Save to daily CSV
+                    new_profile_details.append(details)
                     processed_count += 1
-                    logging.info(f'Saved profile {processed_count}/{len(new_profiles)} to database')
+                    logging.info(f'Processed new profile {processed_count}/{len(new_profiles)}')
                 time.sleep(1)  # Be nice to the server
             
-            logging.info(f'Completed saving {processed_count} new profiles to main database')
+            if new_profile_details:
+                self.save_profile_details(new_profile_details)  # Save to main CSV
+                self.save_new_profiles(new_profile_details)     # Save to daily new profiles CSV
+            
+            # Then, check existing profiles for updates
+            existing_profiles = current_links - new_profiles
+            updated_profile_details = []
+            for url in existing_profiles:
+                details = self.get_profile_details(url)
+                if details:
+                    # Save profile details will handle the update check
+                    if self.save_profile_details([details]):
+                        updated_profile_details.append(details)
+                        updated_count += 1
+                        logging.info(f'Updated existing profile {updated_count}/{len(existing_profiles)}')
+                time.sleep(1)  # Be nice to the server
+            
+            if updated_profile_details:
+                self.save_new_profiles(updated_profile_details, is_update=True)  # Save to daily updated profiles CSV
+            
+            logging.info(f'Completed processing: {processed_count} new profiles, {updated_count} updated profiles')
         except Exception as e:
             logging.error(f"Error in main scraping process: {str(e)}")
             raise
