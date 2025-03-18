@@ -31,7 +31,7 @@ class RosasidanScraper:
         
         # Configure retry strategy
         retry_strategy = Retry(
-            total=3,  # number of retries
+            total=5,  # number of retries
             backoff_factor=0.5,  # wait 0.5, 1, 2, 4... seconds between retries
             status_forcelist=[500, 502, 503, 504, 429]  # HTTP status codes to retry on
         )
@@ -80,14 +80,14 @@ class RosasidanScraper:
                         logging.info(f"'No ads were found' message detected on {url}, moving to next base URL")
                         break
 
-                    # Find all profile links (based on the HTML structure)
+                    # Find all profile links and titles from h3 tags
                     found_links = False
-                    for link in soup.find_all('a', href=True):
-                        href = link['href']
-                        if '/ads/details/' in href:
-                            full_url = urljoin(self.base_url, href)
+                    for h3_tag in soup.find_all('h3'):
+                        link = h3_tag.find('a', href=True)
+                        if link and '/ads/details/' in link['href']:
+                            full_url = urljoin(self.base_url, link['href'])
                             profile_links.add(full_url)
-                            base_urls[full_url] = (base_url, page)
+                            base_urls[full_url] = (base_url, page, link.get_text(strip=True))
                             found_links = True
                     
                     # If no profile links found on this page
@@ -99,6 +99,8 @@ class RosasidanScraper:
                             break
                     else:
                         consecutive_empty_pages = 0
+                        # Save profile links immediately after each successful page scrape
+                        self.save_profile_links(profile_links, base_urls)
                     
                     time.sleep(2)  # Increased delay between requests
                     logging.info(f"Found {len(profile_links)} profile links so far")
@@ -125,82 +127,72 @@ class RosasidanScraper:
             content_panel = soup.find('div', class_='webpanelcontent3')
             if not content_panel:
                 raise ValueError("Could not find main content panel")
+            
+            # Load profile links data to get base_url and title
+            profile_links_data = {}
+            if os.path.exists(self.profile_links_file):
+                try:
+                    links_df = pd.read_excel(self.profile_links_file)
+                    profile_links_data = links_df.set_index('profile_url').to_dict('index')
+                except Exception as e:
+                    logging.warning(f"Could not read profile links data: {str(e)}")
+            
+            # Get base_url and title from profile links data
+            link_info = profile_links_data.get(profile_url, {})
                 
-            # Extract profile information
+            # Initialize details dictionary
             details = {
+                'base_url': link_info.get('base_url', ''),
                 'profile_url': profile_url,
-                'title': '',
-                'username': '',
-                'description': '',
-                'price': '',
-                'phone': '',
-                'skype': '',
-                'kik': '',
-                'posted_by': '',
-                'posted_time': '',
-                'images': [],
-                'image_count': 0,
-                'scrape_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                'title': link_info.get('title', ''),
+                'scrape_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'images': []
             }
             
-            # Extract title
-            title_link = content_panel.find('a', href='#')
-            if title_link:
-                details['title'] = title_link.text.strip()
+            # Extract main details from ad_detail_column
+            detail_columns = content_panel.find_all('div', class_='ad_detail_column')
+            for column in detail_columns:
+                # Extract text content
+                if column.get_text(strip=True):
+                    details['details'] = column.get_text(strip=True)
+                    break
             
-            # Extract description
-            desc_div = content_panel.find('div', class_='ad_detail_column')
-            if desc_div:
-                details['description'] = desc_div.text.strip()
+            # Extract login country
+            country_img = soup.find('img', id='myImage')
+            if country_img and 'flags' in country_img.get('src', ''):
+                details['login_country'] = country_img.get('src', '').split('/')[-1].split('.')[0].upper()
             
             # Extract price
-            price_row = content_panel.find('div', class_='row', string=lambda text: text and 'Price:' in text if text else False)
-            if price_row:
-                price_value = price_row.find('div', class_='ad_detail_column')
-                if price_value:
-                    details['price'] = price_value.text.strip()
+            price_div = soup.find('div', class_='ad_detail_column', string=lambda text: text and any(char.isdigit() for char in text))
+            if price_div:
+                price_text = price_div.get_text(strip=True)
+                # Extract first number found in the text
+                import re
+                price_match = re.search(r'\d+', price_text)
+                if price_match:
+                    details['price'] = int(price_match.group())
             
-            # Extract phone
-            phone_value = content_panel.find('a', class_='phone_value')
-            if phone_value:
-                details['phone'] = phone_value.text.strip()
-            
-            # Extract Skype
-            skype_value = content_panel.find('a', class_='skype_value')
-            if skype_value:
-                details['skype'] = skype_value.text.strip()
-            
-            # Extract KiK
-            kik_row = content_panel.find('div', class_='row', string=lambda text: text and 'KiK:' in text if text else False)
-            if kik_row:
-                kik_value = kik_row.find('div', class_='ad_detail_column')
-                if kik_value:
-                    details['kik'] = kik_value.text.strip()
+            # Extract phone number
+            phone_div = soup.find('a', class_='btn btn-primary phone_value')
+            if phone_div:
+                details['phone'] = phone_div.get_text(strip=True).replace('\u202d', '').replace('\u202c', '')
             
             # Extract posted by
-            posted_by_row = content_panel.find('div', class_='row', string=lambda text: text and 'Posted by:' in text if text else False)
-            if posted_by_row:
-                posted_by_link = posted_by_row.find('a')
-                if posted_by_link:
-                    details['posted_by'] = posted_by_link.text.strip()
-                    details['username'] = posted_by_link.text.strip()
+            posted_by = soup.find('div', class_='ad_detail_column').find('a')
+            if posted_by:
+                details['posted_by'] = posted_by.get_text(strip=True)
             
-            # Extract posted time
-            posted_time_row = content_panel.find('div', class_='row', string=lambda text: text and 'Posted:' in text if text else False)
-            if posted_time_row:
-                posted_time = posted_time_row.find('div', class_='ad_detail_column')
-                if posted_time:
-                    details['posted_time'] = posted_time.text.strip()
+            # Extract posted date
+            posted_date = soup.find('div', class_='ad_detail_column', string=lambda text: text and 'ago' in text)
+            if posted_date:
+                details['posted_date'] = posted_date.get_text(strip=True)
             
             # Extract images
-            image_divs = content_panel.find_all('div', class_='ad-thumbnail-image')
-            for img_div in image_divs:
-                img = img_div.find('img')
-                if img and 'src' in img.attrs and 'uploads' in img['src']:
-                    img_url = urljoin(self.base_url, img['src'])
-                    details['images'].append(img_url)
-            
-            details['image_count'] = len(details['images'])
+            image_divs = soup.find_all('div', class_='ad-thumbnail-image')
+            for div in image_divs:
+                img = div.find('img')
+                if img and img.get('src'):
+                    details['images'].append(img['src'])
             
             logging.info(f"Successfully scraped details for {profile_url}")
             return details
@@ -230,11 +222,12 @@ class RosasidanScraper:
             # Prepare new data
             data = []
             for link in new_links:
-                base_info = base_urls.get(link, ('Unknown', 0))
+                base_info = base_urls.get(link, ('Unknown', 0, ''))
                 data.append({
-                    'profile_url': link,
                     'base_url': base_info[0],
+                    'profile_url': link,
                     'page_number': base_info[1],
+                    'title': base_info[2],
                     'scrape_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 })
 
@@ -281,7 +274,7 @@ class RosasidanScraper:
             return set()
     
     def save_profile_details(self, profiles: List[Dict]):
-        """Save or update profile details in CSV file"""
+        """Save only new profile details in CSV file without updating existing ones"""
         try:
             df = pd.DataFrame(profiles)
             
@@ -303,12 +296,13 @@ class RosasidanScraper:
                         continue
                 
                 if existing_df is not None:
-                    # Update existing profiles and append new ones
-                    df = pd.concat([existing_df, df]).drop_duplicates(subset=['profile_url'], keep='last')
-            
+                    # Only append new profiles without updating existing ones
+                    existing_urls = set(existing_df['profile_url'])
+                    df = pd.concat([existing_df, df[~df['profile_url'].isin(existing_urls)]], ignore_index=True)
+                
             # Save with UTF-8 encoding
             df.to_csv(self.profile_csv, index=False, encoding='utf-8')
-            logging.info(f"Saved {len(profiles)} profiles to {self.profile_csv}")
+            logging.info(f"Saved {len(profiles)} new profiles to {self.profile_csv}")
         except Exception as e:
             logging.error(f"Error saving profile details: {str(e)}")
             raise
