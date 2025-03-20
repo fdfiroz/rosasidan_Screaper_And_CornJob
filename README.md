@@ -18,28 +18,49 @@ A Python-based web scraper for collecting and monitoring profile information fro
 
 ## Installation
 
-### Standard Installation
+### Manual Setup
 
 1. Clone the repository or download the source code
 
 2. Create and activate a virtual environment:
-
-   Windows:
    ```bash
+   # Windows
    python -m venv .venv
    .venv\Scripts\activate
-   ```
 
-   Unix/MacOS:
-   ```bash
-   python3 -m venv .venv
+   # Linux/macOS
+   python -m venv .venv
    source .venv/bin/activate
    ```
 
-3. Install the required dependencies:
+3. Install required dependencies:
    ```bash
    pip install -r requirements.txt
    ```
+
+### Automated Scheduling Setup
+
+#### Windows
+1. Open PowerShell as Administrator
+2. Navigate to the project directory
+3. Run the scheduling script:
+   ```powershell
+   .\schedule_task.ps1
+   ```
+This will create a Windows Task Scheduler job that runs the scraper daily at 10:00 AM.
+
+#### Linux/macOS
+1. Open Terminal
+2. Navigate to the project directory
+3. Make the setup script executable:
+   ```bash
+   chmod +x setup_cron.sh
+   ```
+4. Run the setup script:
+   ```bash
+   ./setup_cron.sh
+   ```
+This will create a cron job that runs the scraper daily at 10:00 AM.
 
 ### Docker Installation
 
@@ -49,18 +70,6 @@ A Python-based web scraper for collecting and monitoring profile information fro
    ```
 
 2. Run the container:
-
-   Windows (PowerShell):
-   ```powershell
-   docker run -v ${PWD}:/app rosasidan-scraper
-   ```
-
-   Windows (Command Prompt):
-   ```cmd
-   docker run -v %cd%:/app rosasidan-scraper
-   ```
-
-   Unix/MacOS:
    ```bash
    docker run -v $(pwd):/app rosasidan-scraper
    ```
