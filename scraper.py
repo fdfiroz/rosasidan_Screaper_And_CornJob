@@ -324,21 +324,19 @@ class RosasidanScraper:
                 details['skype'] = skype_div.get_text(strip=True)
                 
             # Extract KiK username
-            kik_row = soup.find('div', class_='row')
-            if kik_row and kik_row.find('strong', string='KiK:'):
-                kik_value = kik_row.find('div', class_='ad_detail_column')
+            kik_row = soup.find('strong', string='KiK:')
+            if kik_row and kik_row.find_parent('div', class_='row'):
+                kik_value = kik_row.find_parent('div', class_='row').find('div', class_='ad_detail_column')
                 if kik_value:
                     details['kik'] = kik_value.get_text(strip=True)
-            
+            print(kik_row)
             # Extract posted by
-            posted_by_row = soup.find('div', class_='row', string=lambda text: text and 'Posted by:' in text if text else False)
-            if posted_by_row:
-                posted_by_div = posted_by_row.find('div', class_='ad_detail_column')
-                if posted_by_div:
-                    posted_by = posted_by_div.find('a')
-                    if posted_by:
-                        details['posted_by'] = posted_by.get_text(strip=True)
-            
+            posted_by_row = soup.find('strong', string='Posted by:')
+            if posted_by_row and posted_by_row.find_parent('div', class_='row'):
+                posted_by_value = posted_by_row.find_parent('div', class_='row').find('div', class_='ad_detail_column')
+                if posted_by_value and posted_by_value.find('a'):
+                    details['posted_by'] = posted_by_value.find('a').get_text(strip=True)
+            print(posted_by_row)
             # Extract posted date
             posted_date = soup.find('div', class_='ad_detail_column', string=lambda text: text and text is not None and 'ago' in text)
             if posted_date:
@@ -555,7 +553,7 @@ class RosasidanScraper:
             snapshot_file = os.path.join('Update', f'new_profiles_{current_date}.csv')
 
             # Ensure all profiles have the same structure and order
-            required_columns = ['base_url', 'profile_url', 'title', 'description', 'login_country', 'price', 'skype', 'posted_date', 'phone', 'kik', 'posted_by', 'images', 'folder_link', 'scrape_date']
+            required_columns = ['base_url', 'profile_url', 'title', 'scrape_date', 'images', 'description', 'login_country', 'price', 'skype', 'posted_date', 'phone', 'kik', 'posted_by', 'folder_link']
             for profile in profiles:
                 for col in required_columns:
                     if col not in profile:
@@ -605,6 +603,10 @@ class RosasidanScraper:
                     if not new_profiles.empty:
                         logging.info(f"Found {len(new_profiles)} new profiles to add")
             
+            # Ensure consistent column ordering for both files
+            df = df[required_columns]
+            new_profiles = new_profiles[required_columns]
+
             # Append new profiles to daily snapshot if any exist
             if not new_profiles.empty:
                 # Check if snapshot file exists and append, otherwise create new
@@ -613,7 +615,7 @@ class RosasidanScraper:
                 else:
                     new_profiles.to_csv(snapshot_file, index=False, encoding='utf-8')
                 logging.info(f"Appended {len(new_profiles)} new profiles to {snapshot_file}")
-                    
+            
             # Save all profiles to main CSV
             df.to_csv(self.profile_csv, index=False, encoding='utf-8')
             logging.info(f"Updated main profile database with {len(profiles)} profiles")
