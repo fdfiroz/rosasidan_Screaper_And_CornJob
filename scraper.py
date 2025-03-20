@@ -28,8 +28,9 @@ class RosasidanScraper:
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        self.profile_csv = 'profile_details.csv'
-        self.profile_links_file = 'Profile_Links.xlsx'
+        # Set file paths for Database directory
+        self.profile_csv = os.path.join('Database', 'profile_details.csv')
+        self.profile_links_file = os.path.join('Database', 'Profile_Links.xlsx')
         self.image_download_pool = ThreadPoolExecutor(max_workers=5)
         
         # Configure retry strategy
@@ -323,18 +324,20 @@ class RosasidanScraper:
                 details['skype'] = skype_div.get_text(strip=True)
                 
             # Extract KiK username
-            kik_row = soup.find('div', class_='row', string=lambda text: text and 'KiK:' in text if text else False)
-            if kik_row:
+            kik_row = soup.find('div', class_='row')
+            if kik_row and kik_row.find('strong', string='KiK:'):
                 kik_value = kik_row.find('div', class_='ad_detail_column')
                 if kik_value:
                     details['kik'] = kik_value.get_text(strip=True)
             
             # Extract posted by
-            posted_by_div = soup.find('div', class_='ad_detail_column')
-            if posted_by_div:
-                posted_by = posted_by_div.find('a')
-                if posted_by:
-                    details['posted_by'] = posted_by.get_text(strip=True)
+            posted_by_row = soup.find('div', class_='row', string=lambda text: text and 'Posted by:' in text if text else False)
+            if posted_by_row:
+                posted_by_div = posted_by_row.find('div', class_='ad_detail_column')
+                if posted_by_div:
+                    posted_by = posted_by_div.find('a')
+                    if posted_by:
+                        details['posted_by'] = posted_by.get_text(strip=True)
             
             # Extract posted date
             posted_date = soup.find('div', class_='ad_detail_column', string=lambda text: text and text is not None and 'ago' in text)
@@ -548,10 +551,11 @@ class RosasidanScraper:
             
             # Get current date for snapshot file
             current_date = datetime.now().strftime('%Y_%m_%d')
-            snapshot_file = f'new_profiles_{current_date}.csv'
+            # Set file path for Update directory
+            snapshot_file = os.path.join('Update', f'new_profiles_{current_date}.csv')
 
-            # Ensure all profiles have the same structure
-            required_columns = ['base_url', 'profile_url', 'title', 'scrape_date', 'description', 'images','folder_link', 'location', 'price',  'login_country', 'phone', 'skype', 'kik', 'posted_by', 'posted_date']
+            # Ensure all profiles have the same structure and order
+            required_columns = ['base_url', 'profile_url', 'title', 'description', 'login_country', 'price', 'skype', 'posted_date', 'phone', 'kik', 'posted_by', 'images', 'folder_link', 'scrape_date']
             for profile in profiles:
                 for col in required_columns:
                     if col not in profile:
