@@ -11,6 +11,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import logging
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +29,8 @@ class RosasidanScraper:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         self.profile_csv = 'profile_details.csv'
-        self.profile_links_file = 'Profile Links.xlsx'
+        self.profile_links_file = 'Profile_Links.xlsx'
+        self.image_download_pool = ThreadPoolExecutor(max_workers=5)
         
         # Configure retry strategy
         retry_strategy = Retry(
@@ -47,26 +49,62 @@ class RosasidanScraper:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
-    def make_request(self, url: str, timeout: int = 30) -> requests.Response:
-        """Make HTTP request with retry and timeout handling"""
-        try:
-            response = self.session.get(url, timeout=timeout)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.SSLError as e:
-            logging.warning(f"SSL Error encountered for {url}: {str(e)}")
-            return self.session.get(url, timeout=timeout, verify=False)
-        except requests.exceptions.Timeout:
-            logging.error(f"Timeout error accessing {url}")
-            raise
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error accessing {url}: {str(e)}")
-            raise
+    def make_request(self, url: str, timeout: tuple = (10, 30)) -> requests.Response:
+        """Make HTTP request with retry and timeout handling
+        Args:
+            url: The URL to request
+            timeout: A tuple of (connect timeout, read timeout) in seconds
+        """
+        max_retries = 10
+        base_wait = 2
         
-    def get_profile_links(self) -> Tuple[Set[str], Dict[str, Tuple[str, int]]]:
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, timeout=timeout)
+                response.raise_for_status()
+                return response
+            except requests.exceptions.SSLError as e:
+                logging.warning(f"SSL Error encountered for {url} (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    wait_time = base_wait ** attempt
+                    logging.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                return self.session.get(url, timeout=timeout, verify=False)
+            except requests.exceptions.Timeout as e:
+                if attempt < max_retries - 1:
+                    wait_time = base_wait ** attempt
+                    logging.warning(f"Timeout error accessing {url} (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                logging.error(f"Max retries reached for {url}")
+                raise
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait_time = base_wait ** attempt
+                    logging.warning(f"Error accessing {url} (attempt {attempt + 1}/{max_retries}): {str(e)}. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                logging.error(f"Max retries reached for {url}: {str(e)}")
+                raise
+        
+    def get_profile_links(self) -> Tuple[Set[str], Dict[str, Tuple[str, int, str]]]:
         """Extract all profile links from the ads pages including pagination"""
         profile_links = set()
-        base_urls = {}  # Maps profile URL to (base_url, page_number)
+        base_urls = {}  # Maps profile URL to (base_url, page_number, title)
+        
+        # Create images directory if it doesn't exist
+        images_dir = os.path.join(os.getcwd(), 'images')
+        os.makedirs(images_dir, exist_ok=True)
+        
+        # Load existing profile links if file exists
+        if os.path.exists(self.profile_links_file):
+            try:
+                df = pd.read_excel(self.profile_links_file)
+                profile_links.update(df['profile_url'].tolist())
+            except Exception as e:
+                logging.error(f"Error loading existing profile links: {str(e)}")
+        
         for base_url in self.ads_urls:
             page = 1
             consecutive_empty_pages = 0
@@ -108,8 +146,12 @@ class RosasidanScraper:
                             break
                     else:
                         consecutive_empty_pages = 0
-                        # Save profile links immediately after each successful page scrape
-                        self.save_profile_links(profile_links, base_urls)
+                        # Remove duplicates before saving
+                        new_links = self.filter_existing_links(profile_links)
+                        if new_links:
+                            self.save_profile_links(new_links, base_urls)
+                        else:
+                            logging.info("No new links to save after filtering")
                     
                     time.sleep(2)  # Increased delay between requests
                     logging.info(f"Found {len(profile_links)} profile links so far")
@@ -126,35 +168,101 @@ class RosasidanScraper:
         return profile_links, base_urls
     
     def download_image(self, image_url: str, profile_id: str, index: int) -> str:
-        """Download an image and save it locally"""
-        try:
-            # Create images directory if it doesn't exist
-            os.makedirs('images', exist_ok=True)
-            
-            # Generate unique filename
-            file_extension = image_url.split('.')[-1].split('?')[0]
-            if not file_extension:
-                file_extension = 'jpg'
-            filename = f"{profile_id}_{index}.{file_extension}"
-            filepath = os.path.join('images', filename)
-            
-            # Download and save image
-            response = requests.get(image_url, stream=True)
-            response.raise_for_status()
-            
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            
-            return filepath
-        except Exception as e:
-            logging.error(f"Error downloading image {image_url}: {str(e)}")
+        """Download an image and save it locally in profile-specific folder with retry mechanism"""
+        if not image_url or not profile_id:
+            logging.error(f"Invalid image URL or profile ID: {image_url}")
             return ''
+
+        max_retries = 10
+        base_timeout = 60  # Increased base timeout
+        connect_timeout = 30  # Separate connect timeout
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # Create profile-specific directory inside images folder
+                profile_dir = os.path.join(os.getcwd(), 'images', profile_id)
+                os.makedirs(profile_dir, exist_ok=True)
+                
+                # Generate unique filename
+                try:
+                    file_extension = image_url.split('.')[-1].split('?')[0].lower()
+                    if not file_extension or file_extension not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+                        file_extension = 'jpg'
+                except Exception:
+                    file_extension = 'jpg'
+                    
+                filename = f"{index}.{file_extension}"
+                filepath = os.path.join(profile_dir, filename)
+                
+                # Download and save image with timeout
+                read_timeout = base_timeout * (1.5 ** attempt)  # More gradual exponential backoff
+                response = self.session.get(image_url, stream=True, timeout=(connect_timeout, read_timeout), verify=False)
+                response.raise_for_status()
+                
+                # Verify content type is image
+                content_type = response.headers.get('content-type', '')
+                if not content_type.startswith('image/'):
+                    last_error = f"Invalid content type for {image_url}: {content_type}"
+                    if attempt == max_retries - 1:
+                        logging.error(last_error)
+                        return ''
+                    continue
+                
+                with open(filepath, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                if os.path.getsize(filepath) == 0:
+                    os.remove(filepath)
+                    last_error = f"Downloaded empty file from {image_url}"
+                    if attempt == max_retries - 1:
+                        logging.error(last_error)
+                        return ''
+                    continue
+                
+                logging.info(f"Successfully downloaded image {index} for profile {profile_id}")
+                return filepath
+            except (requests.Timeout, requests.exceptions.SSLError, requests.exceptions.RequestException) as e:
+                last_error = str(e)
+                wait_time = 2 ** attempt  # Exponential backoff for wait time
+                if attempt < max_retries - 1:
+                    logging.warning(f"Error downloading image {image_url} (attempt {attempt + 1}/{max_retries}): {last_error}. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"Failed to download image after {max_retries} attempts: {last_error}")
+                    return ''
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logging.warning(f"Unexpected error downloading image {image_url} (attempt {attempt + 1}/{max_retries}): {last_error}. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"Failed to download image after {max_retries} attempts: {last_error}")
+                    return ''
+        
+        return ''
 
     def get_profile_details(self, profile_url: str) -> Dict:
         """Scrape details from a profile page"""
         try:
+            # First check if profile exists in Profile Links
+            if not os.path.exists(self.profile_links_file):
+                logging.warning(f"Profile Links file not found: {self.profile_links_file}")
+                return {}
+                
+            try:
+                links_df = pd.read_excel(self.profile_links_file)
+                if profile_url not in links_df['profile_url'].values:
+                    logging.warning(f"Profile URL not found in Profile Links: {profile_url}")
+                    return {}
+                profile_links_data = links_df.set_index('profile_url').to_dict('index')
+            except Exception as e:
+                logging.error(f"Could not read Profile Links data: {str(e)}")
+                return {}
+                
             logging.info(f"Fetching details for profile: {profile_url}")
             response = self.make_request(profile_url)
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -162,16 +270,8 @@ class RosasidanScraper:
             # Find the main content panel
             content_panel = soup.find('div', class_='webpanelcontent3')
             if not content_panel:
-                raise ValueError("Could not find main content panel")
-            
-            # Load profile links data to get base_url and title
-            profile_links_data = {}
-            if os.path.exists(self.profile_links_file):
-                try:
-                    links_df = pd.read_excel(self.profile_links_file)
-                    profile_links_data = links_df.set_index('profile_url').to_dict('index')
-                except Exception as e:
-                    logging.warning(f"Could not read profile links data: {str(e)}")
+                logging.warning(f"Could not find main content panel for {profile_url}")
+                return {}
             
             # Get base_url and title from profile links data
             link_info = profile_links_data.get(profile_url, {})
@@ -185,17 +285,17 @@ class RosasidanScraper:
                 'profile_url': profile_url,
                 'title': link_info.get('title', ''),
                 'scrape_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'images': [],
-                'local_images': []
+                'images': []  # Ensure this field is initialized
             }
             
-            # Extract main details from ad_detail_column
-            detail_columns = content_panel.find_all('div', class_='ad_detail_column')
-            for column in detail_columns:
-                # Extract text content
-                if column.get_text(strip=True):
-                    details['details'] = column.get_text(strip=True)
-                    break
+            try:
+                # Extract main details from ad_detail_column
+                detail_column = content_panel.find('div', class_='ad_detail_column')
+                if detail_column and detail_column.get_text(strip=True):
+                    details['description'] = detail_column.get_text(strip=True)
+            except Exception as e:
+                logging.warning(f"Error extracting detail columns for {profile_url}: {str(e)}")
+                # Continue processing other fields even if detail extraction fails
             
             # Extract login country
             country_img = soup.find('img', id='myImage')
@@ -216,28 +316,51 @@ class RosasidanScraper:
             phone_div = soup.find('a', class_='btn btn-primary phone_value')
             if phone_div:
                 details['phone'] = phone_div.get_text(strip=True).replace('\u202d', '').replace('\u202c', '')
+                
+            # Extract Skype ID
+            skype_div = soup.find('a', class_='btn btn-primary skype_value')
+            if skype_div:
+                details['skype'] = skype_div.get_text(strip=True)
+                
+            # Extract KiK username
+            kik_row = soup.find('div', class_='row', string=lambda text: text and 'KiK:' in text if text else False)
+            if kik_row:
+                kik_value = kik_row.find('div', class_='ad_detail_column')
+                if kik_value:
+                    details['kik'] = kik_value.get_text(strip=True)
             
             # Extract posted by
-            posted_by = soup.find('div', class_='ad_detail_column').find('a')
-            if posted_by:
-                details['posted_by'] = posted_by.get_text(strip=True)
+            posted_by_div = soup.find('div', class_='ad_detail_column')
+            if posted_by_div:
+                posted_by = posted_by_div.find('a')
+                if posted_by:
+                    details['posted_by'] = posted_by.get_text(strip=True)
             
             # Extract posted date
-            posted_date = soup.find('div', class_='ad_detail_column', string=lambda text: text and 'ago' in text)
+            posted_date = soup.find('div', class_='ad_detail_column', string=lambda text: text and text is not None and 'ago' in text)
             if posted_date:
                 details['posted_date'] = posted_date.get_text(strip=True)
             
-            # Extract and download images
-            image_divs = soup.find_all('div', class_='ad-thumbnail-image')
-            for index, div in enumerate(image_divs):
-                img = div.find('img')
-                if img and img.get('src'):
-                    image_url = img['src']
-                    details['images'].append(image_url)
-                    # Download and save image locally
-                    local_path = self.download_image(image_url, profile_id, index)
-                    if local_path:
-                        details['local_images'].append(local_path)
+            try:
+                # Extract image URLs and prepare local paths first
+                image_divs = soup.find_all('div', class_='ad-thumbnail-image') if soup else []
+                for index, div in enumerate(image_divs):
+                    if not div:
+                        continue
+                    img = div.find('img')
+                    if img and img.get('src'):
+                        image_url = img['src']
+                        # Transform thumbnail URL to full-size URL by removing 't_' prefix
+                        image_url = image_url.replace('/t_picture_', '/picture_')
+                        details['images'].append(image_url)  # Add image URL to list
+
+                # Download images immediately
+                profile_id = profile_url.split('/')[-2]
+                for index, image_url in enumerate(details['images']):
+                    self.download_image(image_url, profile_id, index)
+            except Exception as e:
+                logging.warning(f"Error processing images for {profile_url}: {str(e)}")
+                # Continue with the rest of the profile details even if image processing fails
             
             logging.info(f"Successfully scraped details for {profile_url}")
             return details
@@ -245,7 +368,51 @@ class RosasidanScraper:
             logging.error(f"Error getting profile details for {profile_url}: {str(e)}")
             return {}
     
-    def save_profile_links(self, links: Set[str], base_urls: Dict[str, Tuple[str, int]]):
+    def filter_existing_links(self, profile_links: Set[str]) -> Set[str]:
+        """Filter out profile links that already exist in the Profile_Links.xlsx file"""
+        if not os.path.exists(self.profile_links_file):
+            # If file doesn't exist, all links are new
+            return profile_links
+            
+        try:
+            existing_df = pd.read_excel(self.profile_links_file)
+            existing_links = set(existing_df['profile_url'].values)
+            new_links = profile_links - existing_links
+            logging.info(f"Found {len(new_links)} new profile links")
+            return new_links
+        except Exception as e:
+            logging.error(f"Error reading existing profile links: {str(e)}")
+            return set()
+            
+    def save_profile_links(self, new_links: Set[str], base_urls: Dict[str, Tuple[str, int, str]]):
+        """Save new profile links to the Excel file"""
+        try:
+            # Prepare data for the new links
+            new_data = [{
+                'profile_url': url,
+                'base_url': base_urls[url][0],
+                'page_number': base_urls[url][1],
+                'title': base_urls[url][2],
+                'date_added': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            } for url in new_links]
+            
+            new_df = pd.DataFrame(new_data)
+            
+            if os.path.exists(self.profile_links_file):
+                # Append to existing file
+                existing_df = pd.read_excel(self.profile_links_file)
+                updated_df = pd.concat([existing_df, new_df], ignore_index=True)
+            else:
+                updated_df = new_df
+                
+            # Save to Excel file
+            updated_df.to_excel(self.profile_links_file, index=False)
+            logging.info(f"Saved {len(new_links)} new profile links to {self.profile_links_file}")
+            
+        except Exception as e:
+            logging.error(f"Error saving profile links: {str(e)}")
+
+    def save_profile_links(self, links: Set[str], base_urls: Dict[str, Tuple[str, int, str]]):
         """Save profile links to Excel file with base URL and page information, avoiding duplicates"""
         try:
             # Load existing links if file exists
@@ -318,21 +485,101 @@ class RosasidanScraper:
             logging.error(f"Error loading existing profiles: {str(e)}")
             return set()
     
-    def save_profile_details(self, profiles: List[Dict]):
-        """Save only new profile details in CSV file and update changed profiles"""
+    def download_profile_images(self, profile: Dict) -> None:
+        """Download images for a profile after its details have been saved using parallel processing"""
         try:
+            if not profile.get('images'):
+                logging.info(f"No images to download for profile {profile.get('profile_url', '')}")
+                return
+            
+            profile_id = profile['profile_url'].split('/')[-2]
+            if isinstance(profile['images'], str):
+                image_urls = [url.strip() for url in profile['images'].split('|') if url.strip()]
+            else:
+                image_urls = [url for url in profile['images'] if url]
+            
+            if not image_urls:
+                logging.info(f"No valid image URLs found for profile {profile.get('profile_url', '')}")
+                return
+            
+            # Create profile directory
+            profile_dir = os.path.join(os.getcwd(), 'images', profile_id)
+            os.makedirs(profile_dir, exist_ok=True)
+            
+            # Submit all image downloads to thread pool
+            futures = {}
+            for index, image_url in enumerate(image_urls):
+                local_path = os.path.join('images', profile_id, f"{index}.jpg")
+                if not os.path.exists(local_path):
+                    future = self.image_download_pool.submit(self.download_image, image_url, profile_id, index)
+                    futures[future] = {'url': image_url, 'index': index}
+            
+            # Track successful and failed downloads
+            successful_downloads = 0
+            failed_downloads = 0
+            
+            # Wait for all downloads to complete with timeout
+            try:
+                for future in as_completed(futures.keys(), timeout=300):  # 5 minutes timeout
+                    try:
+                        result = future.result()
+                        if result:
+                            successful_downloads += 1
+                        else:
+                            failed_downloads += 1
+                            image_info = futures[future]
+                            logging.error(f"Failed to download image {image_info['index']} from {image_info['url']}")
+                    except Exception as e:
+                        failed_downloads += 1
+                        image_info = futures[future]
+                        logging.error(f"Error downloading image {image_info['index']} from {image_info['url']}: {str(e)}")
+            except TimeoutError:
+                logging.error(f"Timeout waiting for image downloads to complete for profile {profile.get('profile_url', '')}")
+            
+            logging.info(f"Completed image downloads for profile {profile.get('profile_url', '')}: {successful_downloads} successful, {failed_downloads} failed")
+        except Exception as e:
+            logging.error(f"Error in parallel image download process for profile {profile.get('profile_url', '')}: {str(e)}")
+
+    def save_profile_details(self, profiles: List[Dict]):
+        """Save profile details in main CSV file and create daily snapshot of new profiles"""
+        try:
+            if not profiles:
+                return
+            
+            # Get current date for snapshot file
+            current_date = datetime.now().strftime('%Y_%m_%d')
+            snapshot_file = f'new_profiles_{current_date}.csv'
+
+            # Ensure all profiles have the same structure
+            required_columns = ['base_url', 'profile_url', 'title', 'scrape_date', 'description', 'images','folder_link', 'location', 'price',  'login_country', 'phone', 'skype', 'kik', 'posted_by', 'posted_date']
+            for profile in profiles:
+                for col in required_columns:
+                    if col not in profile:
+                        profile[col] = ''
+                if isinstance(profile.get('images', []), list):
+                    profile['images'] = '|'.join(profile['images'])
+                # Add folder link using file:// protocol
+                profile_id = profile['profile_url'].split('/')[-2]
+                folder_path = os.path.abspath(os.path.join('images', profile_id))
+                profile['folder_link'] = f'file://{folder_path}'
+                
             df = pd.DataFrame(profiles)
             
-            # Convert images list to string
-            df['images'] = df['images'].apply(lambda x: '|'.join(x) if isinstance(x, list) else '')
+            # Initialize new_profiles DataFrame
+            new_profiles = df.copy()
             
             if os.path.exists(self.profile_csv):
                 # Try different encodings for reading existing file
                 encodings = ['utf-8', 'latin1', 'cp1252']
                 existing_df = None
+                
                 for encoding in encodings:
                     try:
                         existing_df = pd.read_csv(self.profile_csv, encoding=encoding)
+                        # Ensure existing DataFrame has all required columns
+                        for col in required_columns:
+                            if col not in existing_df.columns:
+                                existing_df[col] = ''
                         break
                     except UnicodeDecodeError:
                         continue
@@ -343,77 +590,63 @@ class RosasidanScraper:
                 if existing_df is not None:
                     # Create sets for efficient lookup
                     existing_urls = set(existing_df['profile_url'])
-                    new_urls = set(df['profile_url'])
                     
-                    # Split into new and existing profiles
+                    # Filter out profiles that already exist
                     new_profiles = df[~df['profile_url'].isin(existing_urls)]
-                    existing_profiles = df[df['profile_url'].isin(existing_urls)]
                     
-                    # For existing profiles, update only if data has changed
-                    if not existing_profiles.empty:
-                        for idx, row in existing_profiles.iterrows():
-                            existing_row = existing_df[existing_df['profile_url'] == row['profile_url']].iloc[0]
-                            # Compare relevant fields to check for changes
-                            fields_to_compare = ['details', 'price', 'phone', 'images']
-                            if any(row[field] != existing_row[field] for field in fields_to_compare if field in row and field in existing_row):
-                                # Update the existing row
-                                existing_df.loc[existing_df['profile_url'] == row['profile_url']] = row
-                    
-                    # Combine updated existing profiles with new ones
+                    # Combine with existing profiles for the main CSV
                     df = pd.concat([existing_df, new_profiles], ignore_index=True)
-                
-            # Save with UTF-8 encoding
+                    
+                    # Log the number of new profiles found
+                    if not new_profiles.empty:
+                        logging.info(f"Found {len(new_profiles)} new profiles to add")
+            
+            # Append new profiles to daily snapshot if any exist
+            if not new_profiles.empty:
+                # Check if snapshot file exists and append, otherwise create new
+                if os.path.exists(snapshot_file):
+                    new_profiles.to_csv(snapshot_file, mode='a', header=False, index=False, encoding='utf-8')
+                else:
+                    new_profiles.to_csv(snapshot_file, index=False, encoding='utf-8')
+                logging.info(f"Appended {len(new_profiles)} new profiles to {snapshot_file}")
+                    
+            # Save all profiles to main CSV
             df.to_csv(self.profile_csv, index=False, encoding='utf-8')
-            logging.info(f"Saved {len(profiles)} new profiles to {self.profile_csv}")
+            logging.info(f"Updated main profile database with {len(profiles)} profiles")
         except Exception as e:
             logging.error(f"Error saving profile details: {str(e)}")
             raise
     
-    def save_new_profiles(self, profiles: List[Dict], is_update: bool = False):
-        """Save new or updated profiles to a date-specific CSV file"""
-        if not profiles:
-            logging.info("No profiles to save")
-            return
-            
-        try:
-            # Create filename with current date
-            current_date = datetime.now().strftime('%Y_%m_%d')
-            file_prefix = 'updated' if is_update else 'new'
-            profiles_file = f'{file_prefix}_profiles_{current_date}.csv'
-            
-            # Create DataFrame and save to CSV
-            df = pd.DataFrame(profiles)
-            df['images'] = df['images'].apply(lambda x: '|'.join(x) if isinstance(x, list) else '')
-            df['update_type'] = 'update' if is_update else 'new'
-            df['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # If file exists, append to it
-            if os.path.exists(profiles_file):
-                existing_df = pd.read_csv(profiles_file)
-                df = pd.concat([existing_df, df], ignore_index=True)
-            
-            df.to_csv(profiles_file, index=False)
-            logging.info(f'Saved {len(profiles)} {file_prefix} profiles to {profiles_file}')
-        except Exception as e:
-            logging.error(f"Error saving {file_prefix} profiles: {str(e)}")
-            raise
+
     
     def run(self):
         """Main scraping process"""
         logging.info('Starting scraping process...')
         
         try:
-            # Get all current profile links with their base URLs and page numbers
-            current_links, base_urls = self.get_profile_links()
-            if not current_links:
-                logging.warning('No profile links found')
+            try:
+                # Get and save profile links
+                current_links, base_urls = self.get_profile_links()
+                if not current_links:
+                    logging.warning('No profile links found')
+                    return
+                
+                # Save all current links with their source information
+                self.save_profile_links(current_links, base_urls)
+                
+                # Load existing profiles
+                existing_profiles = self.load_existing_profiles()
+            except Exception as e:
+                logging.error(f"Error reading Profile_Links.xlsx: {str(e)}")
                 return
             
-            # Save all current links with their source information
-            self.save_profile_links(current_links, base_urls)
-            
-            # Load existing profiles
-            existing_profiles = self.load_existing_profiles()
+            # For testing, use existing profiles from Profile_Links.xlsx
+            try:
+                links_df = pd.read_excel(self.profile_links_file)
+                current_links = set(links_df['profile_url'].values)
+            except Exception as e:
+                logging.error(f"Error reading Profile_Links.xlsx: {str(e)}")
+                return
             
             # Find new profiles
             new_profiles = current_links - existing_profiles
@@ -427,35 +660,27 @@ class RosasidanScraper:
             processed_count = 0
             updated_count = 0
             
-            # First, process new profiles
-            new_profile_details = []
+            # Process new profiles with immediate saving
             for url in new_profiles:
                 details = self.get_profile_details(url)
                 if details:
-                    new_profile_details.append(details)
+                    self.save_profile_details([details])  # Save to main CSV immediately
+                    self.download_profile_images(details)  # Download images immediately after saving
                     processed_count += 1
-                    logging.info(f'Processed new profile {processed_count}/{len(new_profiles)}')
+                    logging.info(f'Processed and saved new profile {processed_count}/{len(new_profiles)}')
                 time.sleep(1)  # Be nice to the server
             
-            if new_profile_details:
-                self.save_profile_details(new_profile_details)  # Save to main CSV
-                self.save_new_profiles(new_profile_details)     # Save to daily new profiles CSV
-            
-            # Then, check existing profiles for updates
+            # Check existing profiles for updates with immediate saving
             existing_profiles = current_links - new_profiles
-            updated_profile_details = []
             for url in existing_profiles:
                 details = self.get_profile_details(url)
                 if details:
                     # Save profile details will handle the update check
                     if self.save_profile_details([details]):
-                        updated_profile_details.append(details)
+                        self.download_profile_images(details)  # Download images for updated profiles
                         updated_count += 1
-                        logging.info(f'Updated existing profile {updated_count}/{len(existing_profiles)}')
+                        logging.info(f'Updated and saved existing profile {updated_count}/{len(existing_profiles)}')
                 time.sleep(1)  # Be nice to the server
-            
-            if updated_profile_details:
-                self.save_new_profiles(updated_profile_details, is_update=True)  # Save to daily updated profiles CSV
             
             logging.info(f'Completed processing: {processed_count} new profiles, {updated_count} updated profiles')
         except Exception as e:

@@ -14,7 +14,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY scraper.py .
 
 # Create cron job
-RUN echo "0 0 * * * /usr/local/bin/python /app/scraper.py >> /app/scraper.log 2>&1" > /etc/cron.d/scraper-cron
+#If you want to run the scraper at 10am, change the 0 0 * * * to 0 10 * * *
+# RUN echo "0 0 * * * /usr/local/bin/python /app/scraper.py >> /app/scraper.log 2>&1" > /etc/cron.d/scraper-cron
+RUN echo "0 10 * * * /usr/local/bin/python /app/scraper.py >> /app/scraper.log 2>&1" > /etc/cron.d/scraper-cron
 RUN chmod 0644 /etc/cron.d/scraper-cron
 RUN crontab /etc/cron.d/scraper-cron
 
