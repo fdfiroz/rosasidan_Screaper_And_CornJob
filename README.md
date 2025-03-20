@@ -22,7 +22,21 @@ A Python-based web scraper for collecting and monitoring profile information fro
 
 1. Clone the repository or download the source code
 
-2. Install the required dependencies:
+2. Create and activate a virtual environment:
+
+   Windows:
+   ```bash
+   python -m venv .venv
+   .venv\Scripts\activate
+   ```
+
+   Unix/MacOS:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. Install the required dependencies:
    ```bash
    pip install -r requirements.txt
    ```
@@ -35,9 +49,23 @@ A Python-based web scraper for collecting and monitoring profile information fro
    ```
 
 2. Run the container:
+
+   Windows (PowerShell):
+   ```powershell
+   docker run -v ${PWD}:/app rosasidan-scraper
+   ```
+
+   Windows (Command Prompt):
+   ```cmd
+   docker run -v %cd%:/app rosasidan-scraper
+   ```
+
+   Unix/MacOS:
    ```bash
    docker run -v $(pwd):/app rosasidan-scraper
    ```
+
+The Docker container includes a cron job scheduled to run the scraper daily at 10:00 AM. The scraper output and any errors will be logged to `/app/scraper.log` inside the container (mapped to your local directory).
 
 ## Usage
 
