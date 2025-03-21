@@ -24,7 +24,7 @@ class RosasidanScraper:
     def __init__(self):
         self.base_url = 'https://rosasidan.ws'
         # Include both main sections and their paginated URLs
-        self.ads_urls = [f'{self.base_url}/ads/3', f'{self.base_url}/ads/1']
+        self.ads_urls = [] #[f'{self.base_url}/ads/3', f'{self.base_url}/ads/1']
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
@@ -363,6 +363,102 @@ class RosasidanScraper:
                 logging.warning(f"Error processing images for {profile_url}: {str(e)}")
                 # Continue with the rest of the profile details even if image processing fails
             
+            # Extract category, subcategory, and city
+            try:
+                # Find all webpanelhead elements
+                webpanelheads = soup.find_all('div', class_='webpanelhead')
+                logging.info(f"Found {len(webpanelheads)} webpanelhead elements")
+                
+                # Initialize fields
+                details['category'] = ''
+                details['subcategory'] = ''
+                details['city'] = ''
+                
+                # Process each webpanelhead
+                for idx, webpanelhead in enumerate(webpanelheads):
+                    logging.info(f"Processing webpanelhead {idx + 1}:")
+                    logging.info(f"Content: {webpanelhead.text.strip()}")
+                    
+                    # Get navigation links
+                    links = webpanelhead.find_all('a')
+                    link_texts = [link.get_text(strip=True) for link in links]
+                    
+                    # Skip if no useful navigation info
+                    if len(links) <= 1:
+                        continue
+                        
+                    # Check if this is the main navigation breadcrumb
+                    if "Personal Ads" in link_texts:
+                        logging.info("Found main navigation breadcrumb")
+                        
+                        # Extract category
+                        if "Companionship" in link_texts:
+                            details['category'] = "Companionship"
+                            # Get city after Companionship
+                            for i, text in enumerate(link_texts):
+                                if text == "Companionship" and i + 1 < len(link_texts):
+                                    city_parts = []
+                                    city_parts.append(link_texts[i + 1])
+                                    if i + 2 < len(link_texts) and link_texts[i + 2] in ['North', 'South', 'East', 'West']:
+                                        city_parts.append(link_texts[i + 2])
+                                    details['city'] = " ".join(city_parts)
+                                    break
+                                    
+                        elif "Erotic Services" in link_texts:
+                            details['category'] = "Erotic Services"
+                            # Get subcategory after Erotic Services
+                            for i, text in enumerate(link_texts):
+                                if text == "Erotic Services" and i + 1 < len(link_texts):
+                                    details['subcategory'] = link_texts[i + 1]
+                                    break
+                        
+                        # Map location IDs
+                        location_mapping = {
+                            '4': 'Stockholm', '10': 'Stockholm North', '11': 'Stockholm City',
+                            '12': 'Stockholm South', '45': 'Stockholm East', '16': 'Stockholm West',
+                            '19': 'Västra Götaland', '20': 'Skåne',
+                            '21': 'Sweden', '15': 'International'
+                        }
+                        
+                        # Handle Stockholm special case
+                        stockholm_found = False
+                        stockholm_area = None
+                        
+                        for link in links:
+                            href = link.get('href', '')
+                            for loc_id, city_name in location_mapping.items():
+                                if f'/ads/{loc_id}' in href:
+                                    if 'Stockholm' in city_name:
+                                        if loc_id == '4':
+                                            # Base Stockholm
+                                            stockholm_found = True
+                                        else:
+                                            # Stockholm area (North, South, etc)
+                                            stockholm_area = city_name
+                                        break
+                                    elif not details['city']:
+                                        details['city'] = city_name
+                                        break
+                        
+                        # Set final Stockholm value
+                        if stockholm_found or stockholm_area:
+                            details['city'] = stockholm_area if stockholm_area else 'Stockholm City'
+                        
+                        # Break once we've found and processed the main navigation
+                        if details['category']:
+                            break
+                            
+                logging.info(f"Final extracted data - Category: {details.get('category')}, "
+                          f"Subcategory: {details.get('subcategory')}, City: {details.get('city')}")
+                        
+            except Exception as e:
+                logging.error(f"Error extracting category data: {str(e)}")
+                if webpanelheads:
+                    for idx, head in enumerate(webpanelheads):
+                        logging.error(f"Webpanelhead {idx + 1} content: {head.text}")
+                else:
+                    logging.error("No webpanelhead elements found")
+
             logging.info(f"Successfully scraped details for {profile_url}")
             return details
         except Exception as e:
@@ -553,7 +649,14 @@ class RosasidanScraper:
             snapshot_file = os.path.join('Update', f'new_profiles_{current_date}.csv')
 
             # Ensure all profiles have the same structure and order
-            required_columns = ['base_url', 'profile_url', 'title', 'scrape_date', 'images', 'description', 'login_country', 'price', 'skype', 'posted_date', 'phone', 'kik', 'posted_by', 'folder_link']
+            required_columns = [
+                'base_url', 'profile_url', 'category', 'subcategory', 'title', 'scrape_date', 
+                'images', 'description', 'city', 'login_country', 'price', 
+                'skype', 'posted_date', 'phone', 'kik', 'posted_by',
+                'folder_link'  # Added new columns
+            ]
+
+            # Initialize new fields for existing profiles
             for profile in profiles:
                 for col in required_columns:
                     if col not in profile:
@@ -700,3 +803,5 @@ if __name__ == '__main__':
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
         raise
+
+
