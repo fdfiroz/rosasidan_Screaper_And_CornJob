@@ -24,7 +24,7 @@ class RosasidanScraper:
     def __init__(self):
         self.base_url = 'https://rosasidan.ws'
         # Include both main sections and their paginated URLs
-        self.ads_urls = [] #[f'{self.base_url}/ads/3', f'{self.base_url}/ads/1']
+        self.ads_urls = [f'{self.base_url}/ads/3', f'{self.base_url}/ads/1']
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
@@ -603,21 +603,30 @@ class RosasidanScraper:
             profile_dir = os.path.join(os.getcwd(), 'images', profile_id)
             os.makedirs(profile_dir, exist_ok=True)
             
-            # Submit all image downloads to thread pool
+            # Check which images need to be downloaded
             futures = {}
             for index, image_url in enumerate(image_urls):
-                local_path = os.path.join('images', profile_id, f"{index}.jpg")
-                if not os.path.exists(local_path):
-                    future = self.image_download_pool.submit(self.download_image, image_url, profile_id, index)
-                    futures[future] = {'url': image_url, 'index': index}
+                # Check if image already exists and is valid
+                local_path = os.path.join(profile_dir, f"{index}.jpg")
+                if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                    logging.info(f"Image {index} already exists for profile {profile_id}, skipping...")
+                    continue
+                    
+                # Submit only new or invalid images for download
+                future = self.image_download_pool.submit(self.download_image, image_url, profile_id, index)
+                futures[future] = {'url': image_url, 'index': index}
             
+            if not futures:
+                logging.info(f"All images already downloaded for profile {profile_id}")
+                return
+                
             # Track successful and failed downloads
             successful_downloads = 0
             failed_downloads = 0
             
             # Wait for all downloads to complete with timeout
             try:
-                for future in as_completed(futures.keys(), timeout=300):  # 5 minutes timeout
+                for future in as_completed(futures.keys(), timeout=300):
                     try:
                         result = future.result()
                         if result:
@@ -633,7 +642,7 @@ class RosasidanScraper:
             except TimeoutError:
                 logging.error(f"Timeout waiting for image downloads to complete for profile {profile.get('profile_url', '')}")
             
-            logging.info(f"Completed image downloads for profile {profile.get('profile_url', '')}: {successful_downloads} successful, {failed_downloads} failed")
+            logging.info(f"Completed image downloads for profile {profile_id}: {successful_downloads} successful, {failed_downloads} failed")
         except Exception as e:
             logging.error(f"Error in parallel image download process for profile {profile.get('profile_url', '')}: {str(e)}")
 
